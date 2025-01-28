@@ -1,117 +1,158 @@
 package com.krishna;
-import com.datastax.oss.driver.api.core.CqlSession;
-import com.datastax.oss.driver.api.core.cql.*;
-import com.datastax.oss.driver.api.core.metadata.Node;
-import com.datastax.oss.driver.api.core.type.DataTypes;
-import com.datastax.oss.driver.api.querybuilder.QueryBuilder;
 
-import java.net.InetSocketAddress;
+import com.datastax.oss.driver.api.core.CqlSession;
+import com.datastax.oss.driver.api.core.ConsistencyLevel;
+import com.datastax.oss.driver.api.core.cql.*;
 import java.time.Instant;
-import java.util.List;
 import java.util.UUID;
+import java.util.List;
+import java.net.InetSocketAddress;
 
 public class UserActivityLogger {
+    private final CqlSession session;
+    private final PreparedStatement insertStatement;
+    private final PreparedStatement recentActivitiesStatement;
+    private final PreparedStatement timeRangeStatement;
 
-    private CqlSession session;
-
-    public UserActivityLogger(String node, int port, String keyspace) {
-        session = CqlSession.builder()
-                .addContactPoint(new InetSocketAddress(node, port))
-                .withKeyspace(keyspace)
+    public UserActivityLogger(String contactPoint, String keyspace) {
+        this.session = CqlSession.builder()
+                .addContactPoint(InetSocketAddress.createUnresolved(contactPoint, 9042))
                 .withLocalDatacenter("datacenter1")
                 .build();
-    }
-  // for creating schema
-//    public void createSchema() {
-//        String createKeyspaceQuery = "CREATE KEYSPACE IF NOT EXISTS activity_log "
-//                + "WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': '3'};";
-//        session.execute(createKeyspaceQuery);
-//
-//        String createTableQuery = "CREATE TABLE IF NOT EXISTS user_activity ("
-//                + "user_id UUID, "
-//                + "activity_id UUID, "
-//                + "activity_type TEXT, "
-//                + "timestamp TIMESTAMP, "
-//                + "PRIMARY KEY (user_id, timestamp, activity_id)) "
-//                + "WITH CLUSTERING ORDER BY (timestamp DESC, activity_id ASC);";
-//        session.execute(createTableQuery);
-//    }
+
+        session.execute("CREATE KEYSPACE IF NOT EXISTS " + keyspace + " " +
+                "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}");
+        session.execute("USE " + keyspace);
+        session.execute("CREATE TABLE IF NOT EXISTS user_activities (" +
+                "user_id UUID, " +
+                "timestamp TIMESTAMP, " +
+                "activity_id UUID, " +
+                "activity_type TEXT, " +
+                "PRIMARY KEY ((user_id), timestamp, activity_id)) " +
+                "WITH CLUSTERING ORDER BY (timestamp DESC, activity_id ASC)");
 
 
-    public void insertActivity(UUID userId, UUID activityId, String activityType, Instant timestamp, int ttlSeconds) {
-        String insertQuery = "INSERT INTO user_activity (user_id, activity_id, activity_type, timestamp) "
-                + "VALUES (?, ?, ?, ?) USING TTL ?;";
-        PreparedStatement preparedStatement = session.prepare(insertQuery);
-        BoundStatement boundStatement = preparedStatement.bind(userId, activityId, activityType, timestamp, ttlSeconds);
-        session.execute(boundStatement);
+        this.insertStatement = session.prepare("INSERT INTO user_activities " +
+                "(user_id, timestamp, activity_id, activity_type) " +
+                "VALUES (?, ?, ?, ?) USING TTL ?");
+
+        this.recentActivitiesStatement = session.prepare("SELECT * FROM user_activities " +
+                "WHERE user_id = ? LIMIT ?");
+
+        this.timeRangeStatement = session.prepare("SELECT * FROM user_activities " +
+                "WHERE user_id = ? AND timestamp >= ? AND timestamp <= ?");
     }
 
+    public void logActivity(UUID userId, String activityType, Instant timestamp, int ttlDays) {
+        BoundStatement statement = insertStatement.bind()
+                .setUuid(0, userId)
+                .setInstant(1, timestamp)
+                .setUuid(2, UUID.randomUUID())
+                .setString(3, activityType)
+                .setInt(4, ttlDays * 86400)
+                .setConsistencyLevel(ConsistencyLevel.QUORUM);
+
+        session.execute(statement);
+    }
 
     public List<Row> getRecentActivities(UUID userId, int limit) {
-        String selectQuery = "SELECT * FROM user_activity WHERE user_id = ? LIMIT ?;";
-        PreparedStatement preparedStatement = session.prepare(selectQuery);
-        BoundStatement boundStatement = preparedStatement.bind(userId, limit);
-        ResultSet resultSet = session.execute(boundStatement);
-        return resultSet.all();
-    }
+        BoundStatement statement = recentActivitiesStatement.bind()
+                .setUuid(0, userId)
+                .setInt(1, limit)
+                .setConsistencyLevel(ConsistencyLevel.QUORUM);
 
+        return session.execute(statement).all();
+    }
 
     public List<Row> getActivitiesInTimeRange(UUID userId, Instant start, Instant end) {
-        String selectQuery = "SELECT * FROM user_activity WHERE user_id = ? AND timestamp >= ? AND timestamp <= ?;";
-        PreparedStatement preparedStatement = session.prepare(selectQuery);
-        BoundStatement boundStatement = preparedStatement.bind(userId, start, end);
-        ResultSet resultSet = session.execute(boundStatement);
-        return resultSet.all();
-    }
+        BoundStatement statement = timeRangeStatement.bind()
+                .setUuid(0, userId)
+                .setInstant(1, start)
+                .setInstant(2, end)
+                .setConsistencyLevel(ConsistencyLevel.QUORUM);
 
+        return session.execute(statement).all();
+    }
 
     public void close() {
         session.close();
     }
 
     public static void main(String[] args) {
-        UserActivityLogger logger = new UserActivityLogger("localhost", 9042, "activity_log");
-//        logger.createSchema();
-        UUID userId1 = UUID.randomUUID();
-        UUID userId2 = UUID.randomUUID();
-        UUID activity1 = UUID.randomUUID();
-        UUID activity2 = UUID.randomUUID();
-        UUID activity3 = UUID.randomUUID();
-        UUID activity4 = UUID.randomUUID();
+        UserActivityLogger logger = new UserActivityLogger("127.0.0.1", "activity_log");
+        UUID userId = UUID.randomUUID();
+        Instant baseTime = Instant.now();
 
-        logger.insertActivity(userId1, activity1, "login", Instant.now(), 2592000);
-        logger.insertActivity(userId1, activity2, "view", Instant.now().minusSeconds(120), 2592000);
-        logger.insertActivity(userId2, activity3, "logout", Instant.now().minusSeconds(60), 2592000);
-        logger.insertActivity(userId2, activity4, "purchase", Instant.now().minusSeconds(30), 2592000);
+        Object[][] activities = {
+                {"login", 0L},
+                {"view_home", -60L},
+                {"view_profile", -120L},
+                {"logout", -180L},
+                {"purchase", -240L},
+                {"search", -300L},
+                {"add_to_cart", -360L},
+                {"view_product", -420L},
+                {"update_settings", -480L},
+                {"password_change", -540L}
+        };
 
 
-        List<Row> recentActivities = logger.getRecentActivities(userId1, 10);
-        System.out.println("Recent Activities:");
-        recentActivities.forEach(row -> {
-            System.out.printf(
-                    "User: %s, Activity: %s, Type: %s, Time: %s%n",
+        for (Object[] activity : activities) {
+            long offset = ((Number) activity[1]).longValue();
+            Instant timestamp = baseTime.plusSeconds(offset);
+            logger.logActivity(
+                    userId,
+                    (String) activity[0],
+                    timestamp,
+                    30
+            );
+        }
+
+
+        UUID anotherUser = UUID.randomUUID();
+        logger.logActivity(anotherUser, "login", baseTime.minusSeconds(600), 30);
+        logger.logActivity(anotherUser, "view_home", baseTime.minusSeconds(590), 30);
+
+
+        System.out.println("\nAll recent activities for main user:");
+        List<Row> recentActivities = logger.getRecentActivities(userId, 5); // Retrieve top 5 activities
+        for (Row row : recentActivities) {
+            System.out.printf("user_id: %s, activity_id: %s, timestamp: %s, activity_type: %s%n",
                     row.getUuid("user_id"),
                     row.getUuid("activity_id"),
-                    row.getString("activity_type"),
-                    row.getInstant("timestamp")
-            );
-        });
+                    row.getInstant("timestamp"),
+                    row.getString("activity_type"));
+        }
 
-        Instant end = Instant.now();
-        Instant start = end.minusSeconds(3600);
-        List<Row> rangeActivities = logger.getActivitiesInTimeRange(userId2, start, end);
-        System.out.println("\nActivities in Time Range:");
-        rangeActivities.forEach(row -> {
-            System.out.printf(
-                    "User: %s, Activity: %s, Type: %s, Time: %s%n",
+
+        System.out.println("\nActivities for another user:");
+        List<Row> anotherUserActivities = logger.getRecentActivities(anotherUser, 5); // Retrieve top 5 activities
+        for (Row row : anotherUserActivities) {
+            System.out.printf("user_id: %s, activity_id: %s, timestamp: %s, activity_type: %s%n",
                     row.getUuid("user_id"),
                     row.getUuid("activity_id"),
-                    row.getString("activity_type"),
-                    row.getInstant("timestamp")
-            );
-        });
+                    row.getInstant("timestamp"),
+                    row.getString("activity_type"));
+        }
+
+
+        Instant startTime = baseTime.minusSeconds(300); // Start 5 minutes ago
+        Instant endTime = baseTime.plusSeconds(60);    // End 1 minute in the future
+        System.out.println("\nActivities for main user within time range:");
+        List<Row> activitiesInRange = logger.getActivitiesInTimeRange(userId, startTime, endTime);
+        for (Row row : activitiesInRange) {
+            System.out.printf("user_id: %s, activity_id: %s, timestamp: %s, activity_type: %s%n",
+                    row.getUuid("user_id"),
+                    row.getUuid("activity_id"),
+                    row.getInstant("timestamp"),
+                    row.getString("activity_type"));
+        }
 
 
         logger.close();
     }
 }
+
+
+
+
